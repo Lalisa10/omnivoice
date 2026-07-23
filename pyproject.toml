@@ -41,6 +41,7 @@ dependencies = [
     "numpy",
     "soundfile",
     "librosa",
+    "ray[serve]>=2.55.1",
 ]
 
 [project.optional-dependencies]

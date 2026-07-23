@@ -28,3 +28,5 @@ examples/exp*
 .claude/
 *.wav
 *.jsonl
+model/
+.github/
