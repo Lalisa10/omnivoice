@@ -1,0 +1,54 @@
+# Static NFS PV/PVC (no CSI driver / dynamic provisioner required — works on
+# air-gapped clusters as long as `nfs-common` is installed on the nodes, since
+# it uses Kubernetes' built-in in-tree `nfs:` volume type).
+#
+# Expected layout on the NFS export (pre-populate before deploying, e.g. by
+# rsync-ing from a machine that already has the model, see docs/serving-api.md):
+#
+#   <nfs-export-root>/
+#     models/OmniVoice/        # full local snapshot: config.json, model.safetensors,
+#                               # tokenizer files, and an audio_tokenizer/ subdir.
+#                               # Mounted read-only into the pod.
+#     voices/                  # cloned-voice registry (VoiceClonePrompt .pt/.json
+#                               # files written by POST /v1/voices). Mounted
+#                               # read-write and shared across all replicas, so
+#                               # a voice cloned via one pod is visible to all.
+#
+# Replace NFS_SERVER and the nfs.path below with your actual NFS export.
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: omnivoice-nfs-pv
+  labels:
+    app: omnivoice-serve
+spec:
+  capacity:
+    # Model snapshot (~4-5GB) + headroom for cloned voices. Adjust as needed;
+    # NFS doesn't actually enforce this quota, it's informational for k8s.
+    storage: 50Gi
+  accessModes:
+    - ReadWriteMany
+  persistentVolumeReclaimPolicy: Retain
+  mountOptions:
+    - nfsvers=4.1
+  nfs:
+    server: NFS_SERVER # e.g. 10.0.0.5 or nfs.internal.example.com
+    path: /exports/omnivoice # path on the NFS server
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: omnivoice-nfs-pvc
+  namespace: omnivoice
+  labels:
+    app: omnivoice-serve
+spec:
+  accessModes:
+    - ReadWriteMany
+  # Empty string = "bind to the PV named below, don't dynamically provision".
+  # Required for static provisioning; there is no StorageClass here.
+  storageClassName: ""
+  volumeName: omnivoice-nfs-pv
+  resources:
+    requests:
+      storage: 50Gi

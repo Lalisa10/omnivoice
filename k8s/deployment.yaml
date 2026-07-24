@@ -1,0 +1,148 @@
+# OmniVoice serving deployment. See docs/serving-api.md for the HTTP API this
+# exposes, and k8s/pv-pvc.yaml for the expected NFS layout.
+#
+# Air-gapped notes:
+#   - `image:` must point at your internal registry mirror; docker.io is not
+#     reachable from the cluster. Mirror the image built from this repo's
+#     Dockerfile (e.g. `docker tag ... your-registry.internal/omnivoice/omnivoice-serve:v0.0.1`)
+#     and push it there before applying this manifest.
+#   - OMNIVOICE_MODEL points at a local directory (NFS-mounted), not a
+#     Hugging Face repo id, so no network access is needed to load the model.
+#   - HF_HUB_OFFLINE / TRANSFORMERS_OFFLINE are set as a safety net: if
+#     anything ever falls back to a bare repo id (e.g. a missing
+#     audio_tokenizer/ subdir), it fails fast instead of hanging trying to
+#     reach huggingface.co.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: omnivoice-serve
+  namespace: omnivoice
+  labels:
+    app: omnivoice-serve
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: omnivoice-serve
+  strategy:
+    # Each replica holds an entire GPU; a rolling update needs a 2nd GPU
+    # free to schedule the new pod before the old one terminates. Switch to
+    # Recreate if your cluster only has exactly as many GPUs as replicas.
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: omnivoice-serve
+    spec:
+      # Uncomment and set if your internal registry requires auth:
+      # imagePullSecrets:
+      #   - name: omnivoice-registry-cred
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              # Label set by NVIDIA GPU Operator / Node Feature Discovery.
+              # Verify on your cluster with:
+              #   kubectl get nodes -o json | jq '.items[].metadata.labels["nvidia.com/gpu.product"]'
+              - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: In
+                    values:
+                      - NVIDIA-L4
+      # Adjust/remove to match however your cluster taints GPU nodes.
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      securityContext:
+        runAsNonRoot: true
+        # fsGroup fixes ownership on the NFS-mounted volumes for the
+        # container's non-root `omnivoice` user (uid/gid 999, baked into
+        # the image).
+        fsGroup: 999
+      containers:
+        - name: omnivoice-serve
+          image: your-registry.internal/omnivoice/omnivoice-serve:v0.0.1
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            runAsUser: 999
+            runAsGroup: 999
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+          env:
+            # --- App config (read directly by omnivoice/serving) ---
+            - name: OMNIVOICE_MODEL
+              value: "/models/OmniVoice"
+            - name: OMNIVOICE_DEVICE
+              value: "cuda"
+            - name: OMNIVOICE_VOICE_DIR
+              value: "/data/voices"
+            # --- Hugging Face / transformers cache & offline safety net ---
+            - name: HF_HOME
+              value: "/home/omnivoice/.cache/huggingface"
+            - name: HF_HUB_OFFLINE
+              value: "1"
+            - name: TRANSFORMERS_OFFLINE
+              value: "1"
+          volumeMounts:
+            - name: omnivoice-nfs
+              mountPath: /models/OmniVoice
+              subPath: models/OmniVoice
+              readOnly: true
+            - name: omnivoice-nfs
+              mountPath: /data/voices
+              subPath: voices
+              readOnly: false
+          resources:
+            # nvidia.com/gpu request must equal limit: the device plugin
+            # doesn't support fractional/overcommitted GPU scheduling.
+            requests:
+              cpu: "4"
+              memory: 16Gi
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "8"
+              memory: 32Gi
+              nvidia.com/gpu: "1"
+          # Caveat: /docs only proves the FastAPI/uvicorn process is up.
+          # OmniVoice.from_pretrained() is lazy (omnivoice/serving/model_runtime.py)
+          # and only runs on the *first* request to /v1/audio/speech or
+          # POST /v1/voices — there's no dedicated endpoint that reports
+          # "model loaded onto GPU". So a pod can be Ready while the model
+          # itself hasn't loaded yet, and that first real request will pay
+          # the full load time. If you need to avoid that, send a throwaway
+          # synthesis request right after rollout before routing real traffic.
+          #
+          # Model load onto the GPU (LLM backbone + audio tokenizer) can take
+          # a couple of minutes on first start; give it room before falling
+          # back to liveness/readiness.
+          startupProbe:
+            httpGet:
+              path: /docs
+              port: http
+            periodSeconds: 10
+            failureThreshold: 30
+          readinessProbe:
+            httpGet:
+              path: /docs
+              port: http
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /docs
+              port: http
+            periodSeconds: 15
+            failureThreshold: 3
+      volumes:
+        - name: omnivoice-nfs
+          persistentVolumeClaim:
+            claimName: omnivoice-nfs-pvc

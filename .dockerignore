@@ -1,0 +1,33 @@
+# Keep the build context small and avoid leaking local/dev-only state into images.
+.git/
+.github/
+.venv/
+.vscode/
+.claude/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Local model cache / datasets / outputs (large, host-specific; use volumes instead).
+model/
+results/
+data/
+download/
+local/
+run*/
+exp*/
+examples/data*
+examples/download*
+examples/exp*
+*.wav
+*.jsonl
+
+# Docs & misc not needed inside the image.
+# NOTE: README.md is kept — pyproject.toml's `readme` field points at it and
+# hatchling (build backend) fails `uv sync` if it's missing from the context.
+docs/
+CONTRIBUTING.md
+CLAUDE.md
