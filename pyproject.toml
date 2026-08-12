@@ -93,6 +93,8 @@ explicit = true
 constraint-dependencies = [
     "torch==2.8.0",
     "torchaudio==2.8.0",
+    # Ray 2.55.1 still reads FieldDescriptor.label, removed in protobuf 7.
+    "protobuf<7",
 ]
 
 [tool.ruff.lint]

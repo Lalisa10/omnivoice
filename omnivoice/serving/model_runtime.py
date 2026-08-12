@@ -1,8 +1,8 @@
 """Lazy singleton loader for the OmniVoice model used by the HTTP layer.
 
 Kept separate from api_server.py so the loading logic can be reused as-is
-when this gets wrapped in a Ray Serve deployment (one instance per replica)
-instead of a plain in-process singleton.
+by the Ray Serve GPU deployment. Each replica has its own process and therefore
+its own singleton, so the model is loaded exactly once per replica.
 """
 
 import os

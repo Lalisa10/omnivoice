@@ -7,6 +7,7 @@
 #
 # Run (needs the NVIDIA Container Toolkit on the host):
 #   docker run --gpus all -p 8000:8000 \
+#     --shm-size=2g \
 #     -v omnivoice-hf-cache:/home/omnivoice/.cache/huggingface \
 #     -v omnivoice-voices:/home/omnivoice/.cache/omnivoice/voices \
 #     -e OMNIVOICE_MODEL=k2-fsa/OmniVoice \
@@ -58,6 +59,7 @@ RUN groupadd --system omnivoice && useradd --system --gid omnivoice --create-hom
 WORKDIR /app
 COPY --from=builder --chown=omnivoice:omnivoice /app/.venv /app/.venv
 COPY --chown=omnivoice:omnivoice omnivoice ./omnivoice
+COPY --chown=omnivoice:omnivoice serve_config.yaml ./serve_config.yaml
 
 ENV PATH="/app/.venv/bin:$PATH" \
     PYTHONUNBUFFERED=1 \
@@ -78,4 +80,4 @@ VOLUME ["/home/omnivoice/.cache/huggingface", "/home/omnivoice/.cache/omnivoice"
 
 EXPOSE 8000
 
-CMD ["uvicorn", "omnivoice.serving.api_server:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["serve", "run", "/app/serve_config.yaml", "--blocking"]

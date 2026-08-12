@@ -1,7 +1,9 @@
 # OmniVoice HTTP serving API
 
-HTTP layer defined in [omnivoice/serving/api_server.py](../omnivoice/serving/api_server.py),
-deployed via [k8s/deployment.yaml](../k8s/deployment.yaml) + [k8s/service.yaml](../k8s/service.yaml).
+The Ray Serve application is defined in
+[omnivoice/serving/api_server.py](../omnivoice/serving/api_server.py) and configured by
+[serve_config.yaml](../serve_config.yaml). It is deployed via
+[k8s/deployment.yaml](../k8s/deployment.yaml) + [k8s/service.yaml](../k8s/service.yaml).
 Base URL below assumes the Service is reachable at `omnivoice-serve.omnivoice.svc.cluster.local:8000`
 (in-cluster) or port-forwarded to `localhost:8000`:
 
@@ -22,11 +24,79 @@ Interactive OpenAPI docs are also served at `$BASE_URL/docs` (FastAPI default).
   processing the request.
 - **Only `response_format=wav`** is implemented; other OpenAI-style formats
   (`mp3`, `opus`, `aac`, `flac`, `pcm`) return `400`.
-- **Cold start**: the model loads lazily on the *first* request that needs
-  it (see the probe comment in `k8s/deployment.yaml`), so the first call
-  after a pod starts (or restarts) will be much slower than subsequent ones.
+- **Cold start**: the model loads eagerly when the Ray GPU replica starts.
+  Kubernetes doesn't route traffic until `/healthz` can reach that replica,
+  but rollout still needs enough startup time for model loading.
 - Voices are stored on disk (`OMNIVOICE_VOICE_DIR`), not in the response —
   clone once via `POST /v1/voices`, then reference by `name` afterwards.
+
+## Run and tune Ray Serve
+
+Run the same application used by the container:
+
+```bash
+uv run serve run serve_config.yaml --blocking
+```
+
+The HTTP ingress runs on CPU and forwards synthesis work to one `SpeechModel`
+replica that reserves one GPU. Individual HTTP requests are dynamically batched
+before one vectorized `OmniVoice.generate()` call. The public HTTP API remains
+request-per-audio; batching is internal.
+
+The balanced RTX 5060 8 GB profile in `serve_config.yaml` uses:
+
+```yaml
+user_config:
+  max_batch_size: 2
+  batch_wait_timeout_s: 0.02
+```
+
+Ray applies these two `user_config` values through `reconfigure`, so they can be
+changed and redeployed without changing Python code. Keep `max_batch_size: 1`
+as the no-batching baseline. On an 8 GB GPU, benchmark before raising it above
+2; compatible requests are padded to the longest generated sequence and VRAM
+usage grows accordingly.
+
+Requests with different scalar generation settings or different clone modes
+are isolated into compatible sub-batches. A failed sub-batch is retried one
+item at a time so a malformed request doesn't fail its neighbors. CUDA OOM also
+falls back to single-item inference; a single-item OOM returns HTTP 503.
+
+### Load benchmark
+
+After the service is ready, run:
+
+```bash
+uv run python -m omnivoice.serving.load_test \
+  --requests 20 --concurrency 4 --warmup 2
+```
+
+The command reports successful requests, errors, requests/s, generated audio
+seconds/s, and mean/p50/p95/p99 latency. Compare identical runs with
+`max_batch_size: 1` and `2`; useful concurrency values are 1, 2, 4, and 8.
+For the balanced profile, target at least 10% more throughput at concurrency 2+
+while keeping p95 latency below 1.5x the baseline. If p95 is too high, reduce
+the wait timeout from 20 ms to 10 ms and then 0 ms. If batch size 2 still causes
+OOM after fallback, use batch size 1.
+
+Reference measurements on an RTX 5060 Laptop GPU (8 GB), using the default
+short Vietnamese input, concurrency 4, and identical warmups:
+
+| Steps | Batch size | Requests/s | p95 latency | Errors |
+|---:|---:|---:|---:|---:|
+| 8 | 1 | 3.530 | 1.255 s | 0/20 |
+| 8 | 2 | 4.941 | 1.140 s | 0/20 |
+| 32 | 1 | 1.001 | 4.186 s | 0/12 |
+| 32 | 2 | 1.792 | 2.422 s | 0/12 |
+
+These are local reference numbers rather than a capacity guarantee. Batch size
+2 improved throughput by about 40% at 8 steps and 79% at the production-default
+32 steps for this workload.
+
+Ray exposes its standard Serve metrics plus these application metrics:
+`omnivoice_batch_items_total`, `omnivoice_sub_batches_total`,
+`omnivoice_batch_fallbacks_total`, `omnivoice_batch_size`, and
+`omnivoice_inference_seconds`.
 
 ---
 

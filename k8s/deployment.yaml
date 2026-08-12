@@ -101,6 +101,10 @@ spec:
               mountPath: /data/voices
               subPath: voices
               readOnly: false
+            # Ray's plasma object store uses shared memory. Docker's default
+            # /dev/shm (64 MiB) is too small for audio/model request objects.
+            - name: ray-shm
+              mountPath: /dev/shm
           resources:
             # nvidia.com/gpu request must equal limit: the device plugin
             # doesn't support fractional/overcommitted GPU scheduling.
@@ -112,33 +116,24 @@ spec:
               cpu: "8"
               memory: 32Gi
               nvidia.com/gpu: "1"
-          # Caveat: /docs only proves the FastAPI/uvicorn process is up.
-          # OmniVoice.from_pretrained() is lazy (omnivoice/serving/model_runtime.py)
-          # and only runs on the *first* request to /v1/audio/speech or
-          # POST /v1/voices — there's no dedicated endpoint that reports
-          # "model loaded onto GPU". So a pod can be Ready while the model
-          # itself hasn't loaded yet, and that first real request will pay
-          # the full load time. If you need to avoid that, send a throwaway
-          # synthesis request right after rollout before routing real traffic.
-          #
-          # Model load onto the GPU (LLM backbone + audio tokenizer) can take
-          # a couple of minutes on first start; give it room before falling
-          # back to liveness/readiness.
+          # Ray's proxy becomes live before the model actor is ready. Startup
+          # and liveness therefore check the proxy, while readiness calls the
+          # application endpoint that reaches the eagerly-loaded model actor.
           startupProbe:
             httpGet:
-              path: /docs
+              path: /-/healthz
               port: http
             periodSeconds: 10
             failureThreshold: 30
           readinessProbe:
             httpGet:
-              path: /docs
+              path: /healthz
               port: http
             periodSeconds: 10
             failureThreshold: 3
           livenessProbe:
             httpGet:
-              path: /docs
+              path: /-/healthz
               port: http
             periodSeconds: 15
             failureThreshold: 3
@@ -146,3 +141,7 @@ spec:
         - name: omnivoice-nfs
           persistentVolumeClaim:
             claimName: omnivoice-nfs-pvc
+        - name: ray-shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 2Gi
