@@ -1,0 +1,47 @@
+name: Build and publish Docker image
+
+on:
+  push:
+    tags:
+      - "v0.0.3"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docker-publish-v0.0.3
+  cancel-in-progress: false
+
+env:
+  IMAGE_NAME: lalias27/omnivoice
+  IMAGE_TAG: v0.0.3
+
+jobs:
+  publish:
+    name: Build and push
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: lalias27
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
