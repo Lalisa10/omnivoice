@@ -9,6 +9,7 @@
 import asyncio
 import io
 import logging
+import os
 import threading
 import time
 from collections import defaultdict
@@ -30,6 +31,7 @@ from omnivoice.serving.model_runtime import get_model
 from omnivoice.serving.schemas import TTSRequest, VoiceDto, VoicesResponse
 
 logger = logging.getLogger(__name__)
+logger.setLevel(os.environ.get("OMNIVOICE_LOG_LEVEL", "INFO").upper())
 
 app = FastAPI(title="OmniVoice serving with Ray Serve")
 

@@ -107,7 +107,7 @@ async def _run(args) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-url", default="http://127.0.0.1:8000")
-    parser.add_argument("--text", default="Xin chào, đây là OmniVoice.")
+    parser.add_argument("--text", default="Hôm nay trời đẹp quá. Đi uống bia thôi nào. Anh em zô. Đây là đài tiếng nói việt nam, phát thanh từ Hà Nội, thủ đô của nước Việt Nam. Chúc các bạn một ngày vui vẻ.  Xin chào các bạn, chúc các bạn một ngày vui vẻ. Hôm nay trời đẹp quá. Đi uống bia thôi nào. Anh em zô. Đây là đài tiếng nói việt nam, phát thanh từ Hà Nội, thủ đô của nước Việt Nam. Chúc các bạn một ngày vui vẻ. ")
     parser.add_argument("--language", default="Vietnamese")
     parser.add_argument("--ref-voice")
     parser.add_argument("--requests", type=int, default=20)

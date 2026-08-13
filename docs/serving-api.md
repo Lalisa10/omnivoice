@@ -2,8 +2,10 @@
 
 The Ray Serve application is defined in
 [omnivoice/serving/api_server.py](../omnivoice/serving/api_server.py) and configured by
-[serve_config.yaml](../serve_config.yaml). It is deployed via
-[k8s/deployment.yaml](../k8s/deployment.yaml) + [k8s/service.yaml](../k8s/service.yaml).
+[serve_config.yaml](../serve_config.yaml) when run locally. Kubernetes supplies the
+same settings through [k8s/serve-configmap.yaml](../k8s/serve-configmap.yaml), mounted
+by [k8s/deployment.yaml](../k8s/deployment.yaml), and exposes the application through
+[k8s/service.yaml](../k8s/service.yaml). Apply the ConfigMap before the Deployment.
 Base URL below assumes the Service is reachable at `omnivoice-serve.omnivoice.svc.cluster.local:8000`
 (in-cluster) or port-forwarded to `localhost:8000`:
 
@@ -42,6 +44,11 @@ The HTTP ingress runs on CPU and forwards synthesis work to one `SpeechModel`
 replica that reserves one GPU. Individual HTTP requests are dynamically batched
 before one vectorized `OmniVoice.generate()` call. The public HTTP API remains
 request-per-audio; batching is internal.
+
+Application logs default to `INFO`, including a line for every dynamic batch.
+Set `OMNIVOICE_LOG_LEVEL` to another standard Python logging level if needed.
+For example, a successful two-item batch logs
+`Processing dynamic batch: items=2 compatible_sub_batches=1`.
 
 The balanced RTX 5060 8 GB profile in `serve_config.yaml` uses:
 
@@ -92,6 +99,16 @@ short Vietnamese input, concurrency 4, and identical warmups:
 These are local reference numbers rather than a capacity guarantee. Batch size
 2 improved throughput by about 40% at 8 steps and 79% at the production-default
 32 steps for this workload.
+
+For Kubernetes, edit the matching values in `k8s/serve-configmap.yaml`, then apply
+the ConfigMap and restart the Deployment so the Ray Serve process reads the new
+configuration:
+
+```bash
+kubectl apply -f k8s/serve-configmap.yaml
+kubectl -n omnivoice rollout restart deployment/omnivoice-serve
+kubectl -n omnivoice rollout status deployment/omnivoice-serve
+```
 
 Ray exposes its standard Serve metrics plus these application metrics:
 `omnivoice_batch_items_total`, `omnivoice_sub_batches_total`,

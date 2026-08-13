@@ -23,7 +23,7 @@ applications:
         user_config:
           # Safe balanced profile for an RTX 5060 Laptop GPU with 8 GB VRAM.
           max_batch_size: 2
-          batch_wait_timeout_s: 0.02
+          batch_wait_timeout_s: 0.1
       - name: OmniVoiceIngress
         num_replicas: 1
         max_ongoing_requests: 64

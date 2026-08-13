@@ -67,6 +67,14 @@ spec:
         - name: omnivoice-serve
           image: your-registry.internal/omnivoice/omnivoice-serve:v0.0.1
           imagePullPolicy: IfNotPresent
+          # Kubernetes supplies the Ray Serve configuration through a
+          # ConfigMap, while the copy baked into the image remains the local
+          # Docker default.
+          command: ["serve"]
+          args:
+            - run
+            - /etc/omnivoice/serve_config.yaml
+            - --blocking
           securityContext:
             runAsUser: 999
             runAsGroup: 999
@@ -83,6 +91,8 @@ spec:
               value: "/models/OmniVoice"
             - name: OMNIVOICE_DEVICE
               value: "cuda"
+            - name: OMNIVOICE_LOG_LEVEL
+              value: "INFO"
             - name: OMNIVOICE_VOICE_DIR
               value: "/data/voices"
             # --- Hugging Face / transformers cache & offline safety net ---
@@ -93,6 +103,10 @@ spec:
             - name: TRANSFORMERS_OFFLINE
               value: "1"
           volumeMounts:
+            - name: serve-config
+              mountPath: /etc/omnivoice/serve_config.yaml
+              subPath: serve_config.yaml
+              readOnly: true
             - name: omnivoice-nfs
               mountPath: /models/OmniVoice
               subPath: models/OmniVoice
@@ -138,6 +152,9 @@ spec:
             periodSeconds: 15
             failureThreshold: 3
       volumes:
+        - name: serve-config
+          configMap:
+            name: omnivoice-serve-config
         - name: omnivoice-nfs
           persistentVolumeClaim:
             claimName: omnivoice-nfs-pvc

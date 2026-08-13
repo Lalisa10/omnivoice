@@ -64,6 +64,7 @@ COPY --chown=omnivoice:omnivoice serve_config.yaml ./serve_config.yaml
 ENV PATH="/app/.venv/bin:$PATH" \
     PYTHONUNBUFFERED=1 \
     HOME=/home/omnivoice \
+    OMNIVOICE_LOG_LEVEL=INFO \
     OMNIVOICE_MODEL=k2-fsa/OmniVoice
 
 # Pre-create with the right owner: an anonymous VOLUME mounted over a path
