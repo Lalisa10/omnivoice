@@ -3,6 +3,10 @@ proxy_location: HeadOnly
 http_options:
   host: 0.0.0.0
   port: 8000
+  # Ray ends the request with HTTP 408 after this many seconds. Keep it in
+  # sync with SpeechModel's queue_timeout_s below, which sheds the same
+  # request before it reaches the GPU.
+  request_timeout_s: 300
 
 grpc_options:
   port: 9000
@@ -23,7 +27,11 @@ applications:
         user_config:
           # Safe balanced profile for an RTX 5060 Laptop GPU with 8 GB VRAM.
           max_batch_size: 2
-          batch_wait_timeout_s: 0.1
+          batch_wait_timeout_s: 0.02
+          # Drop queued items older than this (seconds) instead of spending
+          # GPU time on a request the client already gave up on. null
+          # disables shedding.
+          queue_timeout_s: 300
       - name: OmniVoiceIngress
         num_replicas: 1
         max_ongoing_requests: 64

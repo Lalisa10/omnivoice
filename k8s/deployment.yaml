@@ -95,6 +95,16 @@ spec:
               value: "INFO"
             - name: OMNIVOICE_VOICE_DIR
               value: "/data/voices"
+            # Uncomment to let POST /v1/voices auto-transcribe ref_audio when
+            # ref_text is omitted (otherwise that request returns 400). Whisper
+            # is loaded at replica startup and costs ~1.5 GB extra VRAM.
+            # OMNIVOICE_ASR_MODEL must be a local directory on air-gapped
+            # clusters: mirror the ASR model onto the NFS volume and mount it
+            # like /models/OmniVoice below.
+            # - name: OMNIVOICE_LOAD_ASR
+            #   value: "1"
+            # - name: OMNIVOICE_ASR_MODEL
+            #   value: "/models/whisper-large-v3-turbo"
             # --- Hugging Face / transformers cache & offline safety net ---
             - name: HF_HOME
               value: "/home/omnivoice/.cache/huggingface"

@@ -29,6 +29,7 @@ from omnivoice.models.omnivoice import VoiceClonePrompt
 from omnivoice.serving import voice_registry
 from omnivoice.serving.model_runtime import get_model
 from omnivoice.serving.schemas import TTSRequest, VoiceDto, VoicesResponse
+from omnivoice.utils.common import str2bool
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.environ.get("OMNIVOICE_LOG_LEVEL", "INFO").upper())
@@ -65,6 +66,9 @@ class SynthesisInput:
     pad_duration: float
     fade_duration: float
     normalize_text: bool
+    # Wall clock, not time.monotonic: the ingress and SpeechModel live in
+    # different processes, whose monotonic clocks share no epoch.
+    enqueued_at: float = 0.0
 
     def compatibility_key(self) -> tuple[Any, ...]:
         """Return fields that must be scalar in one ``generate()`` call."""
@@ -118,7 +122,13 @@ def _to_synthesis_input(
         pad_duration=request.pad_duration,
         fade_duration=request.fade_duration,
         normalize_text=request.normalize_text,
+        enqueued_at=time.time(),
     )
+
+
+def _asr_enabled() -> bool:
+    """Whether the model replicas loaded ASR; ingress shares their pod env."""
+    return str2bool(os.environ.get("OMNIVOICE_LOAD_ASR", "false"))
 
 
 def _is_cuda_oom(error: BaseException) -> bool:
@@ -133,7 +143,11 @@ def _is_cuda_oom(error: BaseException) -> bool:
     name="SpeechModel",
     ray_actor_options={"num_cpus": 1, "num_gpus": 1},
     max_ongoing_requests=8,
-    user_config={"max_batch_size": 2, "batch_wait_timeout_s": 0.02},
+    user_config={
+        "max_batch_size": 2,
+        "batch_wait_timeout_s": 0.02,
+        "queue_timeout_s": 300,
+    },
 )
 class SpeechModel:
     """Own one model/GPU and batch compatible synthesis requests."""
@@ -143,6 +157,7 @@ class SpeechModel:
         # actually resident on the GPU.
         self.model = get_model()
         self._model_lock = threading.Lock()
+        self._queue_timeout_s: float | None = 300.0
         self._batch_items = Counter(
             "omnivoice_batch_items_total",
             description="Synthesis items processed by the GPU deployment.",
@@ -170,12 +185,18 @@ class SpeechModel:
     def reconfigure(self, config: dict[str, Any]) -> None:
         max_batch_size = int(config.get("max_batch_size", 2))
         batch_wait_timeout_s = float(config.get("batch_wait_timeout_s", 0.02))
+        queue_timeout_s = config.get("queue_timeout_s", 300)
         if max_batch_size < 1:
             raise ValueError("max_batch_size must be >= 1")
         if batch_wait_timeout_s < 0:
             raise ValueError("batch_wait_timeout_s must be >= 0")
+        if queue_timeout_s is not None:
+            queue_timeout_s = float(queue_timeout_s)
+            if queue_timeout_s < 0:
+                raise ValueError("queue_timeout_s must be >= 0 or null")
         self.generate.set_max_batch_size(max_batch_size)
         self.generate.set_batch_wait_timeout_s(batch_wait_timeout_s)
+        self._queue_timeout_s = queue_timeout_s
 
     def _generate_compatible(self, items: list[SynthesisInput]) -> list[np.ndarray]:
         first = items[0]
@@ -247,6 +268,37 @@ class SpeechModel:
         for indexed_item in indexed_items:
             self._run_sub_batch([indexed_item], results)
 
+    def _shed_expired(
+        self,
+        indexed_items: list[tuple[int, SynthesisInput]],
+        results: list[SynthesisResult | None],
+    ) -> list[tuple[int, SynthesisInput]]:
+        """Drop queued items nobody is waiting for any more.
+
+        Re-checked before every sub-batch rather than once per batch: sub-
+        batches run sequentially, so a later one can expire while an earlier
+        one occupies the GPU.
+        """
+        timeout = self._queue_timeout_s
+        if timeout is None:
+            return indexed_items
+
+        now = time.time()
+        pending: list[tuple[int, SynthesisInput]] = []
+        for index, item in indexed_items:
+            age = now - item.enqueued_at
+            if age > timeout:
+                results[index] = SynthesisResult(
+                    error=f"timed out after {age:.1f}s in queue", retryable=True
+                )
+            else:
+                pending.append((index, item))
+
+        shed = len(indexed_items) - len(pending)
+        if shed:
+            logger.warning("Shed %d queued item(s) older than %ss", shed, timeout)
+        return pending
+
     def _run_batch_sync(self, items: list[SynthesisInput]) -> list[SynthesisResult]:
         self._batch_items.inc(len(items))
         self._batch_size.observe(len(items))
@@ -264,7 +316,9 @@ class SpeechModel:
         results: list[SynthesisResult | None] = [None] * len(items)
         with self._model_lock:
             for indexed_items in grouped.values():
-                self._run_sub_batch(indexed_items, results)
+                pending = self._shed_expired(indexed_items, results)
+                if pending:
+                    self._run_sub_batch(pending, results)
 
         if any(result is None for result in results):
             raise RuntimeError("Internal batching error: a request has no result")
@@ -281,6 +335,14 @@ class SpeechModel:
     async def create_voice_clone_prompt(
         self, ref_audio: tuple[np.ndarray, int], ref_text: str | None
     ) -> VoiceClonePrompt:
+        if ref_text is None and self.model._asr_pipe is None:
+            # Never let the model lazy-load Whisper here: it would download
+            # and initialize the ASR pipeline while holding _model_lock.
+            raise ValueError(
+                "ref_text is required because no ASR model is loaded; start the "
+                "replica with OMNIVOICE_LOAD_ASR=1 to auto-transcribe ref_audio"
+            )
+
         def create_prompt():
             with self._model_lock:
                 prompt = self.model.create_voice_clone_prompt(
@@ -355,7 +417,10 @@ class OmniVoiceIngress:
 
         voice_clone_prompt = None
         if request.ref_voice is not None:
-            registered = voice_registry.get_voice(request.ref_voice)
+            # Registry reads hit shared (NFS) storage; keep them off the loop.
+            registered = await asyncio.to_thread(
+                voice_registry.get_voice, request.ref_voice
+            )
             if registered is None:
                 raise HTTPException(
                     status_code=404,
@@ -387,10 +452,25 @@ class OmniVoiceIngress:
     def get_voices(self):
         return VoicesResponse(
             voices=[
-                VoiceDto(name=v.name, ref_text=v.prompt.ref_text, language=v.language)
+                VoiceDto(name=v.name, ref_text=v.ref_text, language=v.language)
                 for v in voice_registry.list_voices()
             ]
         )
+
+    @app.post("/v1/voices/refresh", status_code=204)
+    def refresh_voices(self):
+        voice_registry.refresh_cache()
+        return Response(status_code=204)
+
+    @app.delete("/v1/voices/{name}", status_code=204)
+    def delete_voice(self, name: str):
+        try:
+            deleted = voice_registry.delete_voice(name)
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        if not deleted:
+            raise HTTPException(status_code=404, detail=f"voice {name!r} not found")
+        return Response(status_code=204)
 
     @app.post("/v1/voices")
     async def clone_voice(
@@ -408,12 +488,24 @@ class OmniVoiceIngress:
         except ValueError as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
 
-        if voice_registry.get_voice(name) is not None:
+        if ref_text is None and not _asr_enabled():
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "ref_text is required: this deployment has no ASR model "
+                    "loaded. Set OMNIVOICE_LOAD_ASR=1 on the server to enable "
+                    "auto-transcription of ref_audio."
+                ),
+            )
+
+        if await asyncio.to_thread(voice_registry.get_voice, name) is not None:
             raise HTTPException(status_code=409, detail=f"voice {name!r} already exists")
 
         audio_bytes = await ref_audio.read()
         try:
-            waveform, sample_rate = sf.read(io.BytesIO(audio_bytes), dtype="float32")
+            waveform, sample_rate = await asyncio.to_thread(
+                sf.read, io.BytesIO(audio_bytes), dtype="float32"
+            )
         except Exception as error:
             raise HTTPException(
                 status_code=400, detail=f"could not decode ref_audio: {error}"
@@ -424,7 +516,9 @@ class OmniVoiceIngress:
         prompt = await self.speech_model.create_voice_clone_prompt.remote(
             (waveform, sample_rate), ref_text
         )
-        registered = voice_registry.register_voice(name, prompt, ref_language)
+        registered = await asyncio.to_thread(
+            voice_registry.register_voice, name, prompt, ref_language
+        )
         return VoiceDto(
             name=registered.name,
             ref_text=prompt.ref_text,

@@ -18,12 +18,16 @@ Interactive OpenAPI docs are also served at `$BASE_URL/docs` (FastAPI default).
 
 ## Known limitations of the current serving code
 
-- **`ref_text` is effectively required** when cloning a voice. The model
-  supports auto-transcribing `ref_audio` via a Whisper ASR model, but
+- **`ref_text` is required by default** when cloning a voice. The model can
+  auto-transcribe `ref_audio` with a Whisper ASR model, but
   [omnivoice/serving/model_runtime.py](../omnivoice/serving/model_runtime.py)
-  loads `OmniVoice.from_pretrained()` without `load_asr=True`, so the ASR
-  model is never loaded server-side. Omitting `ref_text` will raise an error
-  processing the request.
+  only loads it when `OMNIVOICE_LOAD_ASR` is set (`1`/`true`). Without it,
+  `POST /v1/voices` without `ref_text` fails fast with `400` instead of
+  downloading Whisper in the middle of a request. Enabling it costs about
+  1.5 GB of extra VRAM and loads the ASR model at replica startup;
+  `OMNIVOICE_ASR_MODEL` overrides the model id and accepts a local directory,
+  which is how air-gapped clusters preload it from an NFS mount. See the
+  commented-out env block in [k8s/deployment.yaml](../k8s/deployment.yaml).
 - **Only `response_format=wav`** is implemented; other OpenAI-style formats
   (`mp3`, `opus`, `aac`, `flac`, `pcm`) return `400`.
 - **Cold start**: the model loads eagerly when the Ray GPU replica starts.
@@ -56,9 +60,10 @@ The balanced RTX 5060 8 GB profile in `serve_config.yaml` uses:
 user_config:
   max_batch_size: 2
   batch_wait_timeout_s: 0.02
+  queue_timeout_s: 300
 ```
 
-Ray applies these two `user_config` values through `reconfigure`, so they can be
+Ray applies these `user_config` values through `reconfigure`, so they can be
 changed and redeployed without changing Python code. Keep `max_batch_size: 1`
 as the no-batching baseline. On an 8 GB GPU, benchmark before raising it above
 2; compatible requests are padded to the longest generated sequence and VRAM
@@ -117,6 +122,47 @@ Ray exposes its standard Serve metrics plus these application metrics:
 
 ---
 
+## Request limits & timeouts
+
+A schema-valid request can otherwise occupy the GPU for hours, so every
+public generation parameter is capped. Values outside these ranges are
+rejected by FastAPI with `422 Unprocessable Entity` before any GPU work
+starts:
+
+| Field | Allowed range |
+|---|---|
+| `input` | 1–5000 characters |
+| `duration` | > 0 and <= 300 s |
+| `speed` | 0.25–4.0 |
+| `num_step` | 1–128 |
+| `guidance_scale` | 0–10 |
+| `t_shift` | > 0 and <= 1 |
+| `layer_penalty_factor` | 0–100 |
+| `position_temperature` | 0–100 |
+| `class_temperature` | 0–10 |
+| `audio_chunk_duration` | 5–30 s |
+| `audio_chunk_threshold` | 10–120 s |
+| `pad_duration` | 0–5 s |
+| `fade_duration` | 0–5 s |
+| `sample_rate` | 8000–48000 Hz |
+
+Two timeouts bound how long a request can live:
+
+- `http_options.request_timeout_s` (default `300`) in `serve_config.yaml` /
+  `k8s/serve-configmap.yaml`. Ray ends the HTTP request with `408 Request
+  Timeout` once it expires.
+- `user_config.queue_timeout_s` for `SpeechModel` (default `300`, `null`
+  disables). Items that waited longer than this are dropped before the
+  `generate()` call that would have run them, so the GPU is not spent on a
+  client that already disconnected. A shed item returns `503` with
+  `speech synthesis failed: timed out after N.Ns in queue`.
+
+Keep both values equal: `queue_timeout_s` only reclaims GPU time for
+requests the HTTP layer has already abandoned. `503` responses are
+retryable (queue shedding, CUDA OOM); `500` responses are not.
+
+---
+
 ## `POST /v1/audio/speech` — synthesize speech
 
 Generates a WAV file from text. Three modes, chosen by which fields you set:
@@ -131,26 +177,26 @@ Generates a WAV file from text. Three modes, chosen by which fields you set:
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
-| `input` | string | **required** | Text to synthesize. |
+| `input` | string | **required** | Text to synthesize. 1–5000 characters. |
 | `ref_voice` | string \| null | `null` | Name of a voice previously cloned via `POST /v1/voices`. Mutually exclusive in practice with `instructions`. |
 | `instructions` | string \| null | `null` | Voice-design prompt (accent, gender, tone, ...). Used when `ref_voice` is not set. |
 | `language` | string \| null | `"Vietnamese"` | Target language name (e.g. `"English"`, `"Vietnamese"`). |
 | `response_format` | string | `"wav"` | Only `"wav"` is implemented today; anything else returns `400`. |
-| `sample_rate` | int \| null | `null` (model native, 24000 Hz) | If set and different from the model's native rate, the server resamples before returning. |
-| `duration` | float \| null | `null` | Target output duration in seconds. Overrides `speed` if both are set. |
-| `speed` | float \| null | `1.0` | Speech rate multiplier. |
-| `num_step` | int \| null | `32` | Diffusion denoising steps. Higher = slower, potentially higher quality. |
-| `guidance_scale` | float \| null | `2.0` | Classifier-free guidance scale. |
-| `t_shift` | float \| null | `0.1` | Diffusion time-shift parameter. |
+| `sample_rate` | int \| null | `null` (model native, 24000 Hz) | If set and different from the model's native rate, the server resamples before returning. Range 8000–48000. |
+| `duration` | float \| null | `null` | Target output duration in seconds. Overrides `speed` if both are set. Range > 0 to 300. |
+| `speed` | float \| null | `1.0` | Speech rate multiplier. Range 0.25–4.0. |
+| `num_step` | int \| null | `32` | Diffusion denoising steps. Higher = slower, potentially higher quality. Range 1–128. |
+| `guidance_scale` | float \| null | `2.0` | Classifier-free guidance scale. Range 0–10. |
+| `t_shift` | float \| null | `0.1` | Diffusion time-shift parameter. Range > 0 to 1. |
 | `denoise` | bool \| null | `true` | Whether to apply the denoising pass. |
 | `postprocess_output` | bool \| null | `true` | Apply output post-processing (e.g. trimming). |
-| `layer_penalty_factor` | float \| null | `5.0` | Penalty applied across codebook layers during decoding. |
-| `position_temperature` | float \| null | `5.0` | Sampling temperature over token positions. |
-| `class_temperature` | float \| null | `0.0` | Sampling temperature over token classes. |
-| `audio_chunk_duration` | float \| null | `15.0` | Chunk size (seconds) used for long-text chunked generation. |
-| `audio_chunk_threshold` | float \| null | `30.0` | Text/duration threshold above which chunked generation kicks in. |
-| `pad_duration` | float \| null | `0.1` | Silence padding (seconds) added around chunks. |
-| `fade_duration` | float \| null | `0.1` | Crossfade duration (seconds) between chunks. |
+| `layer_penalty_factor` | float \| null | `5.0` | Penalty applied across codebook layers during decoding. Range 0–100. |
+| `position_temperature` | float \| null | `5.0` | Sampling temperature over token positions. Range 0–100. |
+| `class_temperature` | float \| null | `0.0` | Sampling temperature over token classes. Range 0–10. |
+| `audio_chunk_duration` | float \| null | `15.0` | Chunk size (seconds) used for long-text chunked generation. Range 5–30. |
+| `audio_chunk_threshold` | float \| null | `30.0` | Text/duration threshold above which chunked generation kicks in. Range 10–120. |
+| `pad_duration` | float \| null | `0.1` | Silence padding (seconds) added around chunks. Range 0–5. |
+| `fade_duration` | float \| null | `0.1` | Crossfade duration (seconds) between chunks. Range 0–5. |
 | `normalize_text` | bool \| null | `false` | Opt-in text normalization (numbers, dates, currency -> spoken form). |
 
 Response: raw `audio/wav` bytes (`200`), or `400` if `response_format` is
@@ -215,6 +261,10 @@ curl -sS -X POST "$BASE_URL/v1/audio/speech" \
 |---|---|
 | `400` | `response_format` other than `"wav"`. |
 | `404` | `ref_voice` set but no voice with that name is registered. |
+| `408` | The request exceeded `request_timeout_s` (default 300 s). |
+| `422` | A field is outside its allowed range (see Request limits & timeouts). |
+| `500` | Synthesis failed for a non-retryable reason. |
+| `503` | Retryable failure: the item was shed after `queue_timeout_s`, or a single-item CUDA OOM. |
 
 ---
 
@@ -246,7 +296,7 @@ curl -sS "$BASE_URL/v1/voices"
 |---|---|---|---|---|
 | `name` | string (form) | **required** | — | Unique voice name. Letters, digits, `_`, `-` only. `409` if it already exists. |
 | `ref_audio` | file | **required** | — | Reference audio file (any format `soundfile` can decode). |
-| `ref_text` | string (form) | effectively required* | `null` | Transcript of `ref_audio`. *Auto-transcription via ASR is documented but not enabled in this deployment (see Known limitations above) — omitting it will error. |
+| `ref_text` | string (form) | required by default* | `null` | Transcript of `ref_audio`. *Omitting it returns `400` unless the server runs with `OMNIVOICE_LOAD_ASR=1`, which enables auto-transcription (see Known limitations above). |
 | `ref_language` | string (form) | optional | `"Vietnamese"` | Stored alongside the voice, returned by `GET /v1/voices`. |
 
 ### curl — all fields
@@ -267,5 +317,41 @@ curl -sS -X POST "$BASE_URL/v1/voices" \
 
 | Status | Cause |
 |---|---|
-| `400` | Invalid `name` (bad characters), or `ref_audio` could not be decoded. |
+| `400` | Invalid `name` (bad characters), `ref_audio` could not be decoded, or `ref_text` was omitted while server-side ASR is disabled. |
 | `409` | A voice with that `name` is already registered. |
+
+---
+
+## `DELETE /v1/voices/{name}` — delete a cloned voice
+
+Deletes the prompt and metadata from the shared voice volume, then refreshes
+the complete voice cache. A generation marker makes every replica clear its
+local cache on its next voice request.
+
+```bash
+curl -sS -X DELETE "$BASE_URL/v1/voices/my-voice"
+```
+
+A successful deletion returns `204 No Content`.
+
+### Errors
+
+| Status | Cause |
+|---|---|
+| `400` | Invalid `name` (only letters, digits, `_`, and `-` are allowed). |
+| `404` | No cached or stored voice exists with that name. |
+
+---
+
+## `POST /v1/voices/refresh` — refresh all voice caches
+
+Clears the complete in-memory voice cache. The endpoint writes a generation
+marker to the shared voice volume, so every replica clears its local cache on
+its next voice request.
+
+```bash
+curl -sS -X POST "$BASE_URL/v1/voices/refresh"
+```
+
+A successful refresh returns `204 No Content`. Voice files in the shared
+volume are not modified; prompts are loaded lazily again when requested.
