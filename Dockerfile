@@ -19,10 +19,12 @@
 # -e HF_ENDPOINT=https://hf-mirror.com
 
 ARG PYTHON_VERSION=3.12
+ARG INSTALL_FLASHINFER=0
 
 # ---- builder: resolve deps with uv (incl. the pinned torch/torchaudio cu128
 # wheels from pyproject.toml) and install the project into a venv ----------
 FROM ghcr.io/astral-sh/uv:python${PYTHON_VERSION}-bookworm-slim AS builder
+ARG INSTALL_FLASHINFER
 
 ENV UV_COMPILE_BYTECODE=1 \
     UV_LINK_MODE=copy \
@@ -42,6 +44,13 @@ COPY pyproject.toml uv.lock README.md ./
 COPY omnivoice ./omnivoice
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --locked --no-dev
+
+# FlashInfer is optional so CPU/MPS and generic CUDA images remain portable.
+# This image uses PyTorch cu128; choose the matching FlashInfer wheel index.
+RUN if [ "$INSTALL_FLASHINFER" = "1" ]; then \
+      uv pip install flashinfer-python==0.6.15.post1 "flashinfer-jit-cache==0.6.15.post1+cu128" \
+        --extra-index-url https://flashinfer.ai/whl/cu128/; \
+    fi
 
 # ---- runtime: slim image with just the venv + source -----------------------
 FROM python:${PYTHON_VERSION}-slim-bookworm AS runtime
@@ -65,6 +74,8 @@ ENV PATH="/app/.venv/bin:$PATH" \
     PYTHONUNBUFFERED=1 \
     HOME=/home/omnivoice \
     OMNIVOICE_LOG_LEVEL=INFO \
+    OMNIVOICE_ENABLE_FLASHINFER=0 \
+    OMNIVOICE_FLASHINFER_CUDA_GRAPH=0 \
     OMNIVOICE_MODEL=k2-fsa/OmniVoice
 
 # Pre-create with the right owner: an anonymous VOLUME mounted over a path

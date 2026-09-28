@@ -6,6 +6,7 @@ its own singleton, so the model is loaded exactly once per replica.
 """
 
 import os
+import logging
 
 import torch
 
@@ -13,6 +14,7 @@ from omnivoice.models.omnivoice import OmniVoice
 from omnivoice.utils.common import get_best_device, str2bool
 
 _model: OmniVoice | None = None
+logger = logging.getLogger(__name__)
 
 
 def get_model() -> OmniVoice:
@@ -33,4 +35,25 @@ def get_model() -> OmniVoice:
             load_asr=load_asr,
             asr_model_name=asr_model_name,
         )
+        if str2bool(os.environ.get("OMNIVOICE_ENABLE_FLASHINFER", "false")):
+            if not str(device).startswith("cuda"):
+                raise RuntimeError(
+                    "OMNIVOICE_ENABLE_FLASHINFER requires an NVIDIA CUDA device."
+                )
+            try:
+                from omnivoice.models.omnivoice_flashinfer import apply_flashinfer
+            except ImportError as exc:
+                raise RuntimeError(
+                    "OMNIVOICE_ENABLE_FLASHINFER=1 requires flashinfer-python. "
+                    "Build the serving image with INSTALL_FLASHINFER=1 or install "
+                    "the FlashInfer packages documented in README.md."
+                ) from exc
+
+            enable_cuda_graph = str2bool(
+                os.environ.get("OMNIVOICE_FLASHINFER_CUDA_GRAPH", "false")
+            )
+            apply_flashinfer(_model, enable_cuda_graph=enable_cuda_graph)
+            logger.info(
+                "FlashInfer acceleration enabled (cuda_graph=%s)", enable_cuda_graph
+            )
     return _model

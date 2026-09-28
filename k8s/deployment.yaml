@@ -93,6 +93,13 @@ spec:
               value: "cuda"
             - name: OMNIVOICE_LOG_LEVEL
               value: "INFO"
+            # Requires an image built with --build-arg INSTALL_FLASHINFER=1.
+            # Enable CUDA graphs only for max_batch_size: 1; plain FlashInfer
+            # is generally faster for the dynamic batches used by this server.
+            - name: OMNIVOICE_ENABLE_FLASHINFER
+              value: "1"
+            - name: OMNIVOICE_FLASHINFER_CUDA_GRAPH
+              value: "0"
             - name: OMNIVOICE_VOICE_DIR
               value: "/data/voices"
             # Uncomment to let POST /v1/voices auto-transcribe ref_audio when

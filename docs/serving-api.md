@@ -49,6 +49,21 @@ replica that reserves one GPU. Individual HTTP requests are dynamically batched
 before one vectorized `OmniVoice.generate()` call. The public HTTP API remains
 request-per-audio; batching is internal.
 
+### FlashInfer
+
+The GPU replica can use the upstream FlashInfer decoding path. Build an image
+with the CUDA 12.8 wheels, then set `OMNIVOICE_ENABLE_FLASHINFER=1` (already
+set in `k8s/deployment.yaml`):
+
+```bash
+docker build --build-arg INSTALL_FLASHINFER=1 -t omnivoice-serve:flashinfer .
+```
+
+Keep `OMNIVOICE_FLASHINFER_CUDA_GRAPH=0` for this dynamic-batching profile.
+Set it to `1` only with `max_batch_size: 1`, where CUDA graph replay reduces
+single-request launch overhead. The server fails at replica startup with a
+clear error if FlashInfer is enabled but its package is not in the image.
+
 Application logs default to `INFO`, including a line for every dynamic batch.
 Set `OMNIVOICE_LOG_LEVEL` to another standard Python logging level if needed.
 For example, a successful two-item batch logs

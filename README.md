@@ -334,6 +334,17 @@ Only `id` and `text` are mandatory fields. `ref_audio` and `ref_text` are used i
 
 `language_id`, `duration`, and `speed` are optional. `duration` (in seconds) fixes the output length; `speed` controls the speaking rate. If `duration` and `speed` are both provided, `speed` will be ignored.
 
+### FlashInfer Acceleration
+
+On NVIDIA GPUs, [FlashInfer](https://github.com/flashinfer-ai/flashinfer) provides a lossless 2–2.9x inference speedup through packed CFG attention and fused kernels. Install wheels matching this project's CUDA 12.8 PyTorch build:
+
+```bash
+pip install flashinfer-python==0.6.15.post1 "flashinfer-jit-cache==0.6.15.post1+cu128" \
+    --extra-index-url https://flashinfer.ai/whl/cu128/
+```
+
+For batch CLI inference, pass `--enable_flashinfer true`. Ray Serve setup is documented in [docs/serving-api.md](docs/serving-api.md).
+
 ---
 
 ## Training & Evaluation
