@@ -23,7 +23,7 @@ import torch
 from fastapi import FastAPI, File, Form, HTTPException, Response, UploadFile
 from ray import serve
 from ray.serve.handle import DeploymentHandle
-from ray.util.metrics import Counter, Histogram
+from ray.util.metrics import Counter, Gauge, Histogram
 
 from omnivoice.models.omnivoice import VoiceClonePrompt
 from omnivoice.serving import voice_registry
@@ -33,6 +33,8 @@ from omnivoice.utils.common import str2bool
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.environ.get("OMNIVOICE_LOG_LEVEL", "INFO").upper())
+
+_GIB = 1024**3
 
 app = FastAPI(title="OmniVoice serving with Ray Serve")
 
@@ -147,6 +149,8 @@ def _is_cuda_oom(error: BaseException) -> bool:
         "max_batch_size": 2,
         "batch_wait_timeout_s": 0.02,
         "queue_timeout_s": 300,
+        "cuda_idle_cache_limit_gib": 2.0,
+        "cuda_cache_release_interval_s": 60.0,
     },
 )
 class SpeechModel:
@@ -158,6 +162,9 @@ class SpeechModel:
         self.model = get_model()
         self._model_lock = threading.Lock()
         self._queue_timeout_s: float | None = 300.0
+        self._cuda_idle_cache_limit_bytes: int | None = 2 * _GIB
+        self._cuda_cache_release_interval_s = 60.0
+        self._last_cuda_cache_release = float("-inf")
         self._batch_items = Counter(
             "omnivoice_batch_items_total",
             description="Synthesis items processed by the GPU deployment.",
@@ -181,11 +188,21 @@ class SpeechModel:
             description="Wall time for one compatible model.generate call.",
             boundaries=[0.1, 0.25, 0.5, 1, 2, 5, 10, 30, 60, 120],
         )
+        self._cuda_allocated_bytes = Gauge(
+            "omnivoice_cuda_allocated_bytes",
+            description="Live PyTorch CUDA allocations after a synthesis batch.",
+        )
+        self._cuda_reserved_bytes = Gauge(
+            "omnivoice_cuda_reserved_bytes",
+            description="PyTorch CUDA memory reserved after a synthesis batch.",
+        )
 
     def reconfigure(self, config: dict[str, Any]) -> None:
         max_batch_size = int(config.get("max_batch_size", 2))
         batch_wait_timeout_s = float(config.get("batch_wait_timeout_s", 0.02))
         queue_timeout_s = config.get("queue_timeout_s", 300)
+        idle_cache_limit_gib = config.get("cuda_idle_cache_limit_gib", 2.0)
+        release_interval_s = float(config.get("cuda_cache_release_interval_s", 60.0))
         if max_batch_size < 1:
             raise ValueError("max_batch_size must be >= 1")
         if batch_wait_timeout_s < 0:
@@ -194,9 +211,43 @@ class SpeechModel:
             queue_timeout_s = float(queue_timeout_s)
             if queue_timeout_s < 0:
                 raise ValueError("queue_timeout_s must be >= 0 or null")
+        if idle_cache_limit_gib is not None:
+            idle_cache_limit_gib = float(idle_cache_limit_gib)
+            if not 0 < idle_cache_limit_gib < float("inf"):
+                raise ValueError("cuda_idle_cache_limit_gib must be positive or null")
+        if not 0 <= release_interval_s < float("inf"):
+            raise ValueError("cuda_cache_release_interval_s must be finite and >= 0")
         self.generate.set_max_batch_size(max_batch_size)
         self.generate.set_batch_wait_timeout_s(batch_wait_timeout_s)
         self._queue_timeout_s = queue_timeout_s
+        self._cuda_idle_cache_limit_bytes = (
+            None if idle_cache_limit_gib is None else int(idle_cache_limit_gib * _GIB)
+        )
+        self._cuda_cache_release_interval_s = release_interval_s
+
+    def _release_idle_cuda_cache(self) -> None:
+        """Return unusually large idle allocations to CUDA between batches."""
+        if not torch.cuda.is_available():
+            return
+        allocated = torch.cuda.memory_allocated()
+        reserved = torch.cuda.memory_reserved()
+        now = time.monotonic()
+        limit = self._cuda_idle_cache_limit_bytes
+        if (
+            limit is not None
+            and reserved - allocated >= limit
+            and now - self._last_cuda_cache_release >= self._cuda_cache_release_interval_s
+        ):
+            torch.cuda.empty_cache()
+            self._last_cuda_cache_release = now
+            reserved = torch.cuda.memory_reserved()
+            logger.info(
+                "Released idle CUDA cache: allocated=%.2f GiB reserved=%.2f GiB",
+                allocated / _GIB,
+                reserved / _GIB,
+            )
+        self._cuda_allocated_bytes.set(allocated)
+        self._cuda_reserved_bytes.set(reserved)
 
     def _generate_compatible(self, items: list[SynthesisInput]) -> list[np.ndarray]:
         first = items[0]
@@ -315,10 +366,18 @@ class SpeechModel:
         )
         results: list[SynthesisResult | None] = [None] * len(items)
         with self._model_lock:
-            for indexed_items in grouped.values():
-                pending = self._shed_expired(indexed_items, results)
-                if pending:
-                    self._run_sub_batch(pending, results)
+            try:
+                for indexed_items in grouped.values():
+                    pending = self._shed_expired(indexed_items, results)
+                    if pending:
+                        self._run_sub_batch(pending, results)
+            finally:
+                try:
+                    self._release_idle_cuda_cache()
+                except Exception:
+                    # Memory telemetry and cache housekeeping must not turn a
+                    # successful synthesis into a failed HTTP request.
+                    logger.exception("CUDA memory housekeeping failed")
 
         if any(result is None for result in results):
             raise RuntimeError("Internal batching error: a request has no result")

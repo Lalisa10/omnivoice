@@ -37,6 +37,9 @@ class _Metric:
     def observe(self, *args, **kwargs):
         pass
 
+    def set(self, *args, **kwargs):
+        pass
+
 
 class _FakeModel:
     sampling_rate = 24000
@@ -97,11 +100,16 @@ def _worker(model=None):
     worker.model = model or _FakeModel()
     worker._model_lock = threading.Lock()
     worker._queue_timeout_s = 300.0
+    worker._cuda_idle_cache_limit_bytes = 2 * 1024**3
+    worker._cuda_cache_release_interval_s = 60.0
+    worker._last_cuda_cache_release = float("-inf")
     worker._batch_items = _Metric()
     worker._sub_batches = _Metric()
     worker._fallbacks = _Metric()
     worker._batch_size = _Metric()
     worker._inference_seconds = _Metric()
+    worker._cuda_allocated_bytes = _Metric()
+    worker._cuda_reserved_bytes = _Metric()
     return worker
 
 
@@ -272,6 +280,59 @@ class ServingBatchingTest(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             worker.reconfigure({"queue_timeout_s": -1})
+
+    def test_idle_cuda_cache_is_released_after_batch(self):
+        worker = _worker()
+        gib = 1024**3
+        with (
+            patch("omnivoice.serving.api_server.torch.cuda.is_available", return_value=True),
+            patch("omnivoice.serving.api_server.torch.cuda.memory_allocated", return_value=3 * gib),
+            patch(
+                "omnivoice.serving.api_server.torch.cuda.memory_reserved",
+                side_effect=[6 * gib, 3 * gib],
+            ),
+            patch("omnivoice.serving.api_server.torch.cuda.empty_cache") as release,
+        ):
+            worker._run_batch_sync([_item("one")])
+        release.assert_called_once_with()
+
+    def test_cuda_housekeeping_failure_does_not_fail_synthesis(self):
+        worker = _worker()
+        with (
+            patch.object(worker, "_release_idle_cuda_cache", side_effect=RuntimeError("metrics unavailable")),
+            self.assertLogs("omnivoice.serving.api_server", level="ERROR"),
+        ):
+            result = worker._run_batch_sync([_item("one")])[0]
+        self.assertIsNone(result.error)
+
+    def test_cuda_cache_stays_when_memory_is_live_or_interval_has_not_elapsed(self):
+        worker = _worker()
+        gib = 1024**3
+        with (
+            patch("omnivoice.serving.api_server.torch.cuda.is_available", return_value=True),
+            patch("omnivoice.serving.api_server.torch.cuda.memory_allocated", return_value=5 * gib),
+            patch("omnivoice.serving.api_server.torch.cuda.memory_reserved", return_value=6 * gib),
+            patch("omnivoice.serving.api_server.torch.cuda.empty_cache") as release,
+        ):
+            worker._run_batch_sync([_item("one")])
+        release.assert_not_called()
+
+        worker._last_cuda_cache_release = time.monotonic()
+        with (
+            patch("omnivoice.serving.api_server.torch.cuda.is_available", return_value=True),
+            patch("omnivoice.serving.api_server.torch.cuda.memory_allocated", return_value=3 * gib),
+            patch("omnivoice.serving.api_server.torch.cuda.memory_reserved", return_value=6 * gib),
+            patch("omnivoice.serving.api_server.torch.cuda.empty_cache") as release,
+        ):
+            worker._run_batch_sync([_item("two")])
+        release.assert_not_called()
+
+    def test_cuda_cache_release_can_be_disabled(self):
+        worker = _worker()
+        worker.reconfigure({"cuda_idle_cache_limit_gib": None})
+        self.assertIsNone(worker._cuda_idle_cache_limit_bytes)
+        with self.assertRaises(ValueError):
+            worker.reconfigure({"cuda_idle_cache_limit_gib": -1})
 
     def test_voice_clone_prompt_without_ref_text_and_asr_fails_fast(self):
         worker = _worker()

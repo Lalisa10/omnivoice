@@ -135,6 +135,21 @@ Ray exposes its standard Serve metrics plus these application metrics:
 `omnivoice_batch_fallbacks_total`, `omnivoice_batch_size`, and
 `omnivoice_inference_seconds`.
 
+### CUDA memory after long requests
+
+The GPU worker exports `omnivoice_cuda_allocated_bytes` (live PyTorch tensors)
+and `omnivoice_cuda_reserved_bytes` (memory held by PyTorch's CUDA allocator)
+after each synthesis batch. The default `user_config` returns idle allocations
+to CUDA when `reserved - allocated` reaches 2 GiB, at most once per 60 seconds.
+This runs between batches while the model lock is held. Set
+`cuda_idle_cache_limit_gib: null` to disable it, or adjust the threshold and
+`cuda_cache_release_interval_s` for the workload. Releasing idle cache may
+increase latency on later requests that need those allocations again.
+
+If `reserved` rises while `allocated` stays flat, the increase is allocator
+cache. If `allocated` itself continues to rise after requests finish, inspect
+live tensors and process ownership; releasing idle cache cannot fix that.
+
 ---
 
 ## Request limits & timeouts

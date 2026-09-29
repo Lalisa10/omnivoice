@@ -32,6 +32,11 @@ applications:
           # GPU time on a request the client already gave up on. null
           # disables shedding.
           queue_timeout_s: 300
+          # Return unusually large idle PyTorch allocations to CUDA between
+          # batches. null disables trimming; the interval avoids doing it on
+          # every request under steady traffic.
+          cuda_idle_cache_limit_gib: 2.0
+          cuda_cache_release_interval_s: 60.0
       - name: OmniVoiceIngress
         num_replicas: 1
         max_ongoing_requests: 64
